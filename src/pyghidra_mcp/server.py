@@ -57,6 +57,15 @@ mcp.tool()(mcp_tools.read_bytes)
 mcp.tool()(mcp_tools.gen_callgraph)
 mcp.tool()(mcp_tools.import_binary)
 
+# Write tools
+mcp.tool()(mcp_tools.rename_function)
+mcp.tool()(mcp_tools.set_comment)
+mcp.tool()(mcp_tools.create_function)
+mcp.tool()(mcp_tools.create_label)
+mcp.tool()(mcp_tools.set_function_prototype)
+mcp.tool()(mcp_tools.rename_variable)
+mcp.tool()(mcp_tools.set_variable_datatype)
+
 
 def init_pyghidra_context(
     mcp: FastMCP,

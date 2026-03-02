@@ -1,10 +1,17 @@
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 from mcp import StdioServerParameters
+
+# Resolve GHIDRA_INSTALL_DIR from the environment, falling back to CI default.
+# Also resolve the python executable so it works on systems without a `python` alias.
+_GHIDRA_DIR = os.environ.get("GHIDRA_INSTALL_DIR", "/ghidra")
+_PYTHON = sys.executable or "python"
+_ENV = {"GHIDRA_INSTALL_DIR": _GHIDRA_DIR}
 
 
 @pytest.fixture(scope="module")
@@ -86,11 +93,9 @@ void function_two() {
 def server_params_no_input():
     """Get server parameters with no test binary."""
     return StdioServerParameters(
-        command="python",  # Executable
-        # Run with test binary
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--wait-for-analysis"],
-        # Optional environment variables
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )
 
 
@@ -98,11 +103,9 @@ def server_params_no_input():
 def server_params(test_binary):
     """Get server parameters with a test binary."""
     return StdioServerParameters(
-        command="python",  # Executable
-        # Run with test binary
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--wait-for-analysis", test_binary],
-        # Optional environment variables
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )
 
 
@@ -110,11 +113,9 @@ def server_params(test_binary):
 def server_params_no_thread(test_binary):
     """Get server parameters with a test binary."""
     return StdioServerParameters(
-        command="python",  # Executable
-        # Run with test binary
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--no-threaded", test_binary],  # no-thread for chromadb_testing
-        # Optional environment variables
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )
 
 
@@ -122,11 +123,9 @@ def server_params_no_thread(test_binary):
 def server_params_shared_object(test_shared_object):
     """Get server parameters with a test binary."""
     return StdioServerParameters(
-        command="python",  # Executable
-        # Run with test binary
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--wait-for-analysis", test_shared_object],
-        # Optional environment variables
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )
 
 
@@ -152,9 +151,9 @@ def server_params_existing_notepad_project():
     """Server with existing notepad project from other_projects/"""
     project_path = Path(__file__).parent.parent.parent / "other_projects" / "notepad.gpr"
     return StdioServerParameters(
-        command="python",
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--project-path", str(project_path), "--wait-for-analysis"],
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )
 
 
@@ -170,9 +169,9 @@ def server_params_custom_project_name(custom_project_directory):
     """Server with custom project path and name"""
     custom_project = custom_project_directory / "my_analysis_project"
     return StdioServerParameters(
-        command="python",
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--project-path", str(custom_project), "--wait-for-analysis"],
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )
 
 
@@ -181,7 +180,7 @@ def server_params_nested_project_location(custom_project_directory):
     """Server with nested project location"""
     nested_project = custom_project_directory / "deeply/nested/location/test_project"
     return StdioServerParameters(
-        command="python",
+        command=_PYTHON,
         args=["-m", "pyghidra_mcp", "--project-path", str(nested_project), "--wait-for-analysis"],
-        env={"GHIDRA_INSTALL_DIR": "/ghidra"},
+        env=_ENV,
     )

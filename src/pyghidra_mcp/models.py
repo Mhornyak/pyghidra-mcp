@@ -181,6 +181,71 @@ class BytesReadResult(BaseModel):
     data: str = Field(..., description="The raw bytes as a hexadecimal string.")
 
 
+class CommentType(str, Enum):
+    """Type of comment to set on an address in the binary."""
+
+    EOL = "EOL"
+    PRE = "PRE"
+    POST = "POST"
+    PLATE = "PLATE"
+    REPEATABLE = "REPEATABLE"
+
+
+class RenameFunctionResult(BaseModel):
+    """Result of renaming a function."""
+
+    old_name: str = Field(..., description="The previous name of the function.")
+    new_name: str = Field(..., description="The new name of the function.")
+    address: str = Field(..., description="The entry point address of the function.")
+
+
+class SetCommentResult(BaseModel):
+    """Result of setting a comment at an address."""
+
+    address: str = Field(..., description="The address where the comment was set.")
+    comment_type: CommentType = Field(..., description="The type of comment that was set.")
+    comment: str = Field(..., description="The comment text that was set.")
+
+
+class CreateFunctionResult(BaseModel):
+    """Result of creating a function at an address."""
+
+    name: str = Field(..., description="The name of the created function.")
+    address: str = Field(..., description="The entry point address of the created function.")
+
+
+class CreateLabelResult(BaseModel):
+    """Result of creating a label at an address."""
+
+    name: str = Field(..., description="The name of the created label.")
+    address: str = Field(..., description="The address where the label was created.")
+
+
+class SetFunctionPrototypeResult(BaseModel):
+    """Result of setting a function's prototype/signature."""
+
+    name: str = Field(..., description="The name of the function.")
+    old_prototype: str = Field(..., description="The previous prototype string.")
+    new_prototype: str = Field(..., description="The new prototype string.")
+
+
+class RenameVariableResult(BaseModel):
+    """Result of renaming a variable within a function."""
+
+    function_name: str = Field(..., description="The name of the containing function.")
+    old_name: str = Field(..., description="The previous name of the variable.")
+    new_name: str = Field(..., description="The new name of the variable.")
+
+
+class SetVariableDataTypeResult(BaseModel):
+    """Result of changing a variable's data type."""
+
+    function_name: str = Field(..., description="The name of the containing function.")
+    variable_name: str = Field(..., description="The name of the variable.")
+    old_type: str = Field(..., description="The previous data type.")
+    new_type: str = Field(..., description="The new data type.")
+
+
 class CallGraphDirection(str, Enum):
     """Represents the direction of the call graph."""
 

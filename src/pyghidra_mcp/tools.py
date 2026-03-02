@@ -6,6 +6,7 @@ import functools
 import logging
 import re
 import typing
+from contextlib import contextmanager
 
 from ghidrecomp.callgraph import gen_callgraph
 from jpype import JByte
@@ -17,11 +18,19 @@ from pyghidra_mcp.models import (
     CallGraphResult,
     CodeSearchResult,
     CodeSearchResults,
+    CommentType,
+    CreateFunctionResult,
+    CreateLabelResult,
     CrossReferenceInfo,
     DecompiledFunction,
     ExportInfo,
     ImportInfo,
+    RenameFunctionResult,
+    RenameVariableResult,
     SearchMode,
+    SetCommentResult,
+    SetFunctionPrototypeResult,
+    SetVariableDataTypeResult,
     StringInfo,
     StringSearchResult,
     SymbolInfo,
@@ -59,6 +68,86 @@ class GhidraTools:
         self.program_info = program_info
         self.program = program_info.program
         self.decompiler = program_info.decompiler
+
+    # ── Infrastructure for write tools ──────────────────────────────────
+
+    @contextmanager
+    def _transaction(self, description: str):
+        """Context manager wrapping Ghidra program transactions with rollback on error."""
+        txn = self.program.startTransaction(description)
+        try:
+            yield
+        except Exception:
+            self.program.endTransaction(txn, False)
+            raise
+        else:
+            self.program.endTransaction(txn, True)
+
+    def _save_program(self):
+        """Persist changes to the Ghidra project file.
+
+        If the domain file cannot be locked (e.g. a background thread is decompiling
+        for ChromaDB indexing), the save is skipped. Changes are already committed
+        in-memory by endTransaction and will be flushed when the project closes or
+        when the next save succeeds.
+        """
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        try:
+            self.program.getDomainFile().save(ConsoleTaskMonitor())
+        except Exception as e:
+            if "Unable to lock" in str(e) or "active transaction" in str(e):
+                logger.debug(f"Save deferred (active transaction): {e}")
+            else:
+                raise
+
+    def _resolve_address(self, address_str: str):
+        """Parse an address string into a Ghidra Address object."""
+        af = self.program.getAddressFactory()
+        addr_str = address_str
+        if address_str.lower().startswith("0x"):
+            addr_str = address_str[2:]
+        addr = af.getAddress(addr_str)
+        if addr is None:
+            raise ValueError(f"Invalid address: {address_str}")
+        return addr
+
+    def _refresh_chroma_entry(self, func: "Function"):
+        """Update the ChromaDB vector index entry for a function after a write."""
+        collection = self.program_info.code_collection
+        if not collection:
+            return
+        result = self.decompile_function(func)
+        addr = str(func.getEntryPoint())
+        collection.upsert(
+            ids=[addr],
+            documents=[result.code],
+            metadatas=[{"function_name": result.name, "address": addr}],
+        )
+
+    def _get_high_function(self, func: "Function"):
+        """Decompile a function and return its HighFunction for variable manipulation."""
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        monitor = ConsoleTaskMonitor()
+        result = self.decompiler.decompileFunction(func, 0, monitor)
+        high_func = result.getHighFunction()
+        if high_func is None:
+            raise ValueError(
+                f"Could not decompile function '{func.getName()}' to access variables."
+            )
+        return high_func
+
+    def _find_variable_symbol(self, high_func, variable_name: str):
+        """Find a HighSymbol by name within a decompiled HighFunction."""
+        lsm = high_func.getLocalSymbolMap()
+        for sym in lsm.getSymbols():
+            if sym.getName() == variable_name:
+                return sym
+        available = [sym.getName() for sym in lsm.getSymbols()]
+        raise ValueError(
+            f"Variable '{variable_name}' not found. Available variables: {available}"
+        )
 
     def _get_filename(self, func: "Function"):
         max_path_len = 50
@@ -714,4 +803,159 @@ class GhidraTools:
             display_type=cg_display_type,
             graph=selected_graph_content,
             mermaid_url=mermaid_url,
+        )
+
+    # ── Write tools ─────────────────────────────────────────────────────
+
+    @handle_exceptions
+    def rename_function(self, name_or_address: str, new_name: str) -> RenameFunctionResult:
+        """Rename a function in the binary."""
+        from ghidra.program.model.symbol import SourceType
+
+        func = self.find_function(name_or_address)
+        old_name = func.getName()
+        with self._transaction("Rename function"):
+            func.setName(new_name, SourceType.USER_DEFINED)
+        self._save_program()
+        self._refresh_chroma_entry(func)
+        return RenameFunctionResult(
+            old_name=old_name, new_name=new_name, address=str(func.getEntryPoint())
+        )
+
+    @handle_exceptions
+    def set_comment(
+        self, address_str: str, comment: str, comment_type: CommentType
+    ) -> SetCommentResult:
+        """Set a comment at an address in the binary."""
+        from ghidra.program.model.listing import CodeUnit
+
+        comment_type_map = {
+            CommentType.EOL: CodeUnit.EOL_COMMENT,
+            CommentType.PRE: CodeUnit.PRE_COMMENT,
+            CommentType.POST: CodeUnit.POST_COMMENT,
+            CommentType.PLATE: CodeUnit.PLATE_COMMENT,
+            CommentType.REPEATABLE: CodeUnit.REPEATABLE_COMMENT,
+        }
+
+        addr = self._resolve_address(address_str)
+        ghidra_type = comment_type_map[comment_type]
+        with self._transaction("Set comment"):
+            self.program.getListing().setComment(addr, ghidra_type, comment)
+        self._save_program()
+        return SetCommentResult(
+            address=address_str, comment_type=comment_type, comment=comment
+        )
+
+    @handle_exceptions
+    def create_function_at(
+        self, address_str: str, name: str | None = None
+    ) -> CreateFunctionResult:
+        """Create a new function at the specified address."""
+        from ghidra.app.cmd.function import CreateFunctionCmd
+        from ghidra.program.model.symbol import SourceType
+
+        addr = self._resolve_address(address_str)
+        with self._transaction("Create function"):
+            cmd = CreateFunctionCmd(addr)
+            if not cmd.applyTo(self.program):
+                raise ValueError(
+                    f"Failed to create function at {address_str}. "
+                    "The address may not contain valid code or a function may already exist there."
+                )
+            func = self.program.getFunctionManager().getFunctionAt(addr)
+            if func is None:
+                raise ValueError(f"Function was not created at {address_str}.")
+            if name:
+                func.setName(name, SourceType.USER_DEFINED)
+        self._save_program()
+        self._refresh_chroma_entry(func)
+        return CreateFunctionResult(name=func.getName(), address=address_str)
+
+    @handle_exceptions
+    def create_label(self, address_str: str, name: str) -> CreateLabelResult:
+        """Create a label (symbol) at the specified address."""
+        from ghidra.program.model.symbol import SourceType
+
+        addr = self._resolve_address(address_str)
+        with self._transaction("Create label"):
+            sym = self.program.getSymbolTable().createLabel(
+                addr, name, self.program.getGlobalNamespace(), SourceType.USER_DEFINED
+            )
+            sym.setPrimary()
+        self._save_program()
+        return CreateLabelResult(name=name, address=address_str)
+
+    @handle_exceptions
+    def set_function_prototype(
+        self, name_or_address: str, prototype: str
+    ) -> SetFunctionPrototypeResult:
+        """Set/change a function's prototype (signature)."""
+        from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+        from ghidra.app.util.parser import FunctionSignatureParser
+        from ghidra.program.model.symbol import SourceType
+
+        func = self.find_function(name_or_address)
+        old_sig = func.getSignature().getPrototypeString()
+        with self._transaction("Set function prototype"):
+            parser = FunctionSignatureParser(self.program.getDataTypeManager(), None)
+            func_def = parser.parse(func.getSignature(), prototype)
+            cmd = ApplyFunctionSignatureCmd(
+                func.getEntryPoint(), func_def, SourceType.USER_DEFINED
+            )
+            if not cmd.applyTo(self.program):
+                raise ValueError(
+                    f"Failed to apply prototype '{prototype}' to function '{func.getName()}'."
+                )
+        self._save_program()
+        self._refresh_chroma_entry(func)
+        new_sig = func.getSignature().getPrototypeString()
+        return SetFunctionPrototypeResult(
+            name=func.getName(), old_prototype=old_sig, new_prototype=new_sig
+        )
+
+    @handle_exceptions
+    def rename_variable(
+        self, function_name_or_address: str, old_name: str, new_name: str
+    ) -> RenameVariableResult:
+        """Rename a local variable or parameter within a function."""
+        from ghidra.program.model.pcode import HighFunctionDBUtil
+        from ghidra.program.model.symbol import SourceType
+
+        func = self.find_function(function_name_or_address)
+        high_func = self._get_high_function(func)
+        symbol = self._find_variable_symbol(high_func, old_name)
+        with self._transaction("Rename variable"):
+            HighFunctionDBUtil.updateDBVariable(symbol, new_name, None, SourceType.USER_DEFINED)
+        self._save_program()
+        self._refresh_chroma_entry(func)
+        return RenameVariableResult(
+            function_name=func.getName(), old_name=old_name, new_name=new_name
+        )
+
+    @handle_exceptions
+    def set_variable_datatype(
+        self, function_name_or_address: str, variable_name: str, new_datatype_str: str
+    ) -> SetVariableDataTypeResult:
+        """Change the data type of a local variable or parameter within a function."""
+        from ghidra.app.util.cparser.C import CParser
+        from ghidra.program.model.pcode import HighFunctionDBUtil
+        from ghidra.program.model.symbol import SourceType
+
+        func = self.find_function(function_name_or_address)
+        high_func = self._get_high_function(func)
+        symbol = self._find_variable_symbol(high_func, variable_name)
+        old_type = str(symbol.getDataType())
+        with self._transaction("Set variable data type"):
+            parser = CParser(self.program.getDataTypeManager())
+            new_type = parser.parse(new_datatype_str)
+            HighFunctionDBUtil.updateDBVariable(
+                symbol, None, new_type, SourceType.USER_DEFINED
+            )
+        self._save_program()
+        self._refresh_chroma_entry(func)
+        return SetVariableDataTypeResult(
+            function_name=func.getName(),
+            variable_name=variable_name,
+            old_type=old_type,
+            new_type=new_datatype_str,
         )

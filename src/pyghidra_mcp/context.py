@@ -261,7 +261,13 @@ class PyGhidraContext:
                 return False
 
     def import_binary(
-        self, binary_path: str | Path, analyze: bool = False, relative_path: Path | None = None
+        self,
+        binary_path: str | Path,
+        analyze: bool = False,
+        relative_path: Path | None = None,
+        language_id: str | None = None,
+        base_address: str | None = None,
+        entry_points: list[str] | None = None,
     ) -> None:
         """
         Imports a single binary into the project.
@@ -270,6 +276,12 @@ class PyGhidraContext:
             binary_path: Path to the binary file.
             analyze: Perform analysis on this binary. Useful if not importing in bulk.
             relative_path: Relative path within the project hierarchy (Path("bin") or Path("lib")).
+            language_id: Ghidra language ID (e.g. "6502:LE:16:default"). If provided, forces
+                the import to use this processor/language instead of auto-detection.
+            base_address: Base address for the binary (e.g. "0x0334"). If provided, sets the
+                image base after import.
+            entry_points: List of entry point addresses (e.g. ["0x0CD4"]) where code starts.
+                Functions will be created at these addresses to seed analysis.
 
         Returns:
             None
@@ -299,9 +311,50 @@ class PyGhidraContext:
             program_info = self.programs[full_path]
         else:
             logger.info(f"Importing new program: {program_name}")
-            program = self.project.importProgram(binary_path)
-            program.name = program_name
+
+            if language_id:
+                from ghidra.program.util import DefaultLanguageService
+                from ghidra.program.model.lang import LanguageID
+
+                lang_service = DefaultLanguageService.getLanguageService()
+
+                language = lang_service.getLanguage(LanguageID(language_id))
+                compiler_spec = language.getDefaultCompilerSpec()
+                program = self.project.importProgram(binary_path, language, compiler_spec)
+            else:
+                program = self.project.importProgram(binary_path)
+
             if program:
+                from ghidra.program.flatapi import FlatProgramAPI
+                from ghidra.program.model.symbol import SourceType
+
+                txn = program.startTransaction("Set base address and entry points")
+                try:
+                    flat_api = FlatProgramAPI(program)
+
+                    # Set base address if provided
+                    if base_address:
+                        addr = flat_api.toAddr(base_address)
+                        program.setImageBase(addr, True)
+
+                    # Create functions at specified entry points to seed analysis
+                    if entry_points:
+                        for i, ep in enumerate(entry_points):
+                            ep_addr = flat_api.toAddr(ep)
+                            name = "entry" if i == 0 else f"entry_{i}"
+                            program.getSymbolTable().addExternalEntryPoint(ep_addr)
+                            program.getSymbolTable().createLabel(
+                                ep_addr, name, SourceType.USER_DEFINED
+                            )
+                            flat_api.disassemble(ep_addr)
+                            flat_api.createFunction(ep_addr, name)
+                            logger.info(f"Created entry point '{name}' at {ep}")
+                except Exception as e:
+                    logger.error(f"Error setting up base address/entry points: {e}")
+                finally:
+                    program.endTransaction(txn, True)
+
+                program.name = program_name
                 self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
 
             program_info = self._init_program_info(program)
@@ -311,8 +364,22 @@ class PyGhidraContext:
             raise ImportError(f"Failed to import binary: {binary_path}")
 
         if analyze:
-            self.analyze_program(program_info.program)
-            self._init_chroma_collections_for_program(program_info)
+            try:
+                self.analyze_program(program_info.program)
+                self._init_chroma_collections_for_program(program_info)
+            except Exception as e:
+                logger.error(f"Analysis failed for {program_name}, cleaning up: {e}")
+                # Remove from in-memory tracking
+                df_path = program_info.program.getDomainFile().pathname
+                self.programs.pop(df_path, None)
+                # Remove from Ghidra project to prevent corruption
+                try:
+                    df = program_info.program.getDomainFile()
+                    self.project.close(program_info.program)
+                    df.delete()
+                except Exception as cleanup_err:
+                    logger.error(f"Failed to clean up after analysis error: {cleanup_err}")
+                raise
 
         logger.info(f"Program {program_name} is ready for use.")
 
@@ -431,25 +498,48 @@ class PyGhidraContext:
             result = future.result()
             logger.info(f"Background import task completed successfully. Result: {result}")
         except Exception as e:
+            # Log but don't re-raise — raising in a Future callback is silently
+            # swallowed by the executor and serves no purpose.
             logger.error(f"FATAL ERROR during background binary import: {e}", exc_info=True)
-            raise e
 
-    def import_binary_backgrounded(self, binary_path: str | Path):
+    def import_binary_backgrounded(
+        self,
+        binary_path: str | Path,
+        language_id: str | None = None,
+        base_address: str | None = None,
+        entry_points: list[str] | None = None,
+    ):
         """
         Spawns a thread and imports a binary into the project.
         When the binary is analyzed it will be added to the project.
 
         Args:
             binary_path: The path of the binary to import.
+            language_id: Ghidra language ID (e.g. "6502:LE:16:default").
+            base_address: Base address for the binary (e.g. "0x0334").
+            entry_points: List of entry point addresses to seed analysis.
         """
         if not Path(binary_path).exists():
             raise FileNotFoundError(f"The file {binary_path} cannot be found")
 
         if self.import_executor:
-            future = self.import_executor.submit(self.import_binary, binary_path, analyze=True)
+            future = self.import_executor.submit(
+                self.import_binary,
+                binary_path,
+                analyze=True,
+                language_id=language_id,
+                base_address=base_address,
+                entry_points=entry_points,
+            )
             future.add_done_callback(self._import_callback)
         else:
-            self.import_binary(binary_path, analyze=True)
+            self.import_binary(
+                binary_path,
+                analyze=True,
+                language_id=language_id,
+                base_address=base_address,
+                entry_points=entry_points,
+            )
 
     def get_program_info(self, binary_name: str) -> "ProgramInfo":
         """Get program info or raise ValueError if not found."""
@@ -791,8 +881,23 @@ class PyGhidraContext:
                     logger.info(f"Setting prog option:{k} with value:{v}")
                     self.set_analysis_option(program, k, v)
 
-            if self.no_symbols:
-                logger.warn(f"Disabling symbols for analysis! --no-symbols flag: {self.no_symbols}")
+            # Skip symbol/PDB setup for raw binaries and non-PE/ELF formats
+            exe_format = program.getExecutableFormat()
+            is_standard_format = exe_format and exe_format in (
+                "Executable and Linking Format (ELF)",
+                "Portable Executable (PE)",
+                "Mac OS X Mach-O",
+            )
+
+            if self.no_symbols or not is_standard_format:
+                if not is_standard_format:
+                    logger.info(
+                        f"Skipping symbol setup for non-standard format: {exe_format}"
+                    )
+                else:
+                    logger.warn(
+                        f"Disabling symbols for analysis! --no-symbols flag: {self.no_symbols}"
+                    )
                 self.set_analysis_option(program, "PDB Universal", False)
 
             else:

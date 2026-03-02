@@ -18,13 +18,21 @@ from pyghidra_mcp.models import (
     CallGraphDisplayType,
     CallGraphResult,
     CodeSearchResults,
+    CommentType,
+    CreateFunctionResult,
+    CreateLabelResult,
     CrossReferenceInfos,
     DecompiledFunction,
     ExportInfos,
     ImportInfos,
     ProgramInfo,
     ProgramInfos,
+    RenameFunctionResult,
+    RenameVariableResult,
     SearchMode,
+    SetCommentResult,
+    SetFunctionPrototypeResult,
+    SetVariableDataTypeResult,
     StringSearchResults,
     SymbolSearchResults,
 )
@@ -407,17 +415,197 @@ def gen_callgraph(
 
 
 @mcp_error_handler
-def import_binary(binary_path: str, ctx: Context) -> str:
+def import_binary(
+    binary_path: str,
+    ctx: Context,
+    language_id: str | None = None,
+    base_address: str | None = None,
+    entry_points: list[str] | None = None,
+) -> str:
     """Imports a binary from a designated path into the current Ghidra project.
 
     Args:
         binary_path: The path to the binary file to import.
+        language_id: Ghidra language ID to force a specific processor (e.g. "6502:LE:16:default",
+            "z80:LE:16:default", "8085:LE:16:default"). If not provided, Ghidra will
+            auto-detect the language. Use this for raw binaries or retro/embedded platforms
+            that Ghidra cannot auto-identify.
+        base_address: Base address to load the binary at (e.g. "0x0334", "0xC000"). If not
+            provided, Ghidra uses its default. Useful for raw binaries where the load address
+            is known.
+        entry_points: List of addresses where code entry points exist (e.g. ["0x0CD4"]).
+            Functions will be created at these addresses to seed disassembly and analysis.
+            Essential for raw binaries where Ghidra cannot auto-detect code locations.
     """
     # We would like to do context progress updates, but until that is more
     # widely supported by clients, we will resort to this
     pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-    pyghidra_context.import_binary_backgrounded(binary_path)
-    return (
-        f"Importing {binary_path} in the background."
-        "When ready, it will appear analyzed in binary list."
-    )
+    try:
+        pyghidra_context.import_binary(
+            binary_path,
+            analyze=True,
+            language_id=language_id,
+            base_address=base_address,
+            entry_points=entry_points,
+        )
+        return f"Successfully imported and analyzed {binary_path}."
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Import failed: {e}\n{tb}")
+        return f"Import failed: {e}\nTraceback:\n{tb}"
+
+
+# ── Write Tools ─────────────────────────────────────────────────────────────
+
+
+@mcp_error_handler
+def rename_function(
+    binary_name: str, name_or_address: str, new_name: str, ctx: Context
+) -> RenameFunctionResult:
+    """Renames a function in the binary.
+
+    Args:
+        binary_name: The name of the binary containing the function.
+        name_or_address: The current name or entry-point address of the function.
+        new_name: The new name to assign to the function.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.rename_function(name_or_address, new_name)
+
+
+@mcp_error_handler
+def set_comment(
+    binary_name: str,
+    address: str,
+    comment: str,
+    ctx: Context,
+    comment_type: CommentType = CommentType.EOL,
+) -> SetCommentResult:
+    """Sets a comment at an address in the binary.
+
+    Args:
+        binary_name: The name of the binary.
+        address: The address where the comment should be placed.
+        comment: The comment text.
+        comment_type: The type of comment (EOL, PRE, POST, PLATE, REPEATABLE). Default: EOL.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.set_comment(address, comment, comment_type)
+
+
+@mcp_error_handler
+def create_function(
+    binary_name: str,
+    address: str,
+    ctx: Context,
+    name: str | None = None,
+) -> CreateFunctionResult:
+    """Creates a new function at the specified address.
+
+    Use this when Ghidra's auto-analysis missed a function. Optionally provide
+    a name, otherwise Ghidra will assign a default name.
+
+    Args:
+        binary_name: The name of the binary.
+        address: The address where the function should be created.
+        name: Optional name for the new function.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.create_function_at(address, name)
+
+
+@mcp_error_handler
+def create_label(
+    binary_name: str, address: str, name: str, ctx: Context
+) -> CreateLabelResult:
+    """Creates a label (named symbol) at the specified address.
+
+    Labels mark important addresses in the binary (data, jump targets, etc.)
+    and appear in cross-reference listings and the decompiler output.
+
+    Args:
+        binary_name: The name of the binary.
+        address: The address where the label should be created.
+        name: The name for the label.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.create_label(address, name)
+
+
+@mcp_error_handler
+def set_function_prototype(
+    binary_name: str, name_or_address: str, prototype: str, ctx: Context
+) -> SetFunctionPrototypeResult:
+    """Sets or changes a function's prototype (signature).
+
+    The prototype should be a C-style function signature, e.g.:
+    "int main(int argc, char **argv)"
+
+    Args:
+        binary_name: The name of the binary containing the function.
+        name_or_address: The current name or entry-point address of the function.
+        prototype: The new C-style function prototype string.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.set_function_prototype(name_or_address, prototype)
+
+
+@mcp_error_handler
+def rename_variable(
+    binary_name: str,
+    function_name_or_address: str,
+    old_name: str,
+    new_name: str,
+    ctx: Context,
+) -> RenameVariableResult:
+    """Renames a local variable or parameter within a function.
+
+    Use decompile_function first to see current variable names.
+
+    Args:
+        binary_name: The name of the binary containing the function.
+        function_name_or_address: The name or address of the function containing the variable.
+        old_name: The current name of the variable to rename.
+        new_name: The new name for the variable.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.rename_variable(function_name_or_address, old_name, new_name)
+
+
+@mcp_error_handler
+def set_variable_datatype(
+    binary_name: str,
+    function_name_or_address: str,
+    variable_name: str,
+    new_datatype: str,
+    ctx: Context,
+) -> SetVariableDataTypeResult:
+    """Changes the data type of a local variable or parameter within a function.
+
+    Use decompile_function first to see current variable names and types.
+    The new_datatype should be a C-style type string, e.g.: "int", "char *",
+    "unsigned long".
+
+    Args:
+        binary_name: The name of the binary containing the function.
+        function_name_or_address: The name or address of the function containing the variable.
+        variable_name: The name of the variable whose type should be changed.
+        new_datatype: The new C-style data type string.
+    """
+    pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    return tools.set_variable_datatype(function_name_or_address, variable_name, new_datatype)
